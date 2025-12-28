@@ -2,6 +2,8 @@
 
 ## Kurulum
 
+**Not:** API değişirse anomalib sürümü pinlenebilir.
+
 ## Dataset
 
 ## Train

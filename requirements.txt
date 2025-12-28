@@ -1,2 +1,9 @@
-# Python dependencies
-
+anomalib
+torch
+torchvision
+numpy
+pillow
+matplotlib
+opencv-python
+streamlit
+scikit-learn
