@@ -53,9 +53,9 @@ def parse_args():
 
 
 def main():
-    import os
     import numpy as np
     from sklearn.metrics import roc_auc_score
+    import torch
     
     args = parse_args()
     
@@ -88,7 +88,6 @@ def main():
     
     if device_resolved == "cuda":
         try:
-            import torch
             if torch.cuda.is_available():
                 accelerator_for_engine = "cuda"
             else:
@@ -148,144 +147,131 @@ def main():
     except Exception as e:
         raise RuntimeError(f"Failed to load model from checkpoint: {e}")
     
-    # Create engine/trainer for testing
-    print("Setting up evaluation engine...")
-    if Engine is not None:
-        engine = Engine(
-            accelerator=accelerator_for_engine,
-        )
-    else:
-        from pytorch_lightning import Trainer
-        engine = Trainer(
-            accelerator=accelerator_for_engine if accelerator_for_engine else None,
-            logger=False,
-        )
-    
-    # Run evaluation using Engine.test() - this is the most reliable method
-    print("\nRunning evaluation on test set...")
+    # Try to get metrics from Engine.test() first
     image_auroc = None
     n_test = None
     
-    try:
-        # Use Engine.test() which handles everything correctly
-        test_results = engine.test(model=model, datamodule=datamodule, verbose=False)
-        
-        if test_results and len(test_results) > 0:
-            result_dict = test_results[0]
+    print("\nRunning evaluation on test set...")
+    if Engine is not None:
+        try:
+            engine = Engine(accelerator=accelerator_for_engine)
+            test_results = engine.test(model=model, datamodule=datamodule, verbose=False)
             
-            # Look for image-level AUROC in results
-            for key in result_dict.keys():
-                key_lower = key.lower()
-                if ("image" in key_lower or "auroc" in key_lower) and "auroc" in key_lower:
-                    image_auroc = float(result_dict[key])
-                    print(f"Found image-level AUROC in test results: {key} = {image_auroc:.4f}")
-                    break
-            
-            # Try to find test sample count
-            for key in result_dict.keys():
-                key_lower = key.lower()
-                if "test" in key_lower and ("size" in key_lower or "count" in key_lower or "n" in key_lower or "samples" in key_lower):
-                    n_test = int(result_dict[key])
-                    break
-            
-            # If no specific count found, try to infer from other metrics
-            if n_test is None:
-                # Look for any numeric value that might be sample count
-                for key, value in result_dict.items():
-                    if isinstance(value, (int, float)) and value > 0 and value < 10000:
-                        # This might be sample count
-                        if "size" in key.lower() or "count" in key.lower() or "n" in key.lower():
-                            n_test = int(value)
-                            break
-    except Exception as e:
-        print(f"Warning: Engine.test() failed: {e}")
-        print("Trying alternative evaluation method...")
+            if test_results and len(test_results) > 0:
+                result_dict = test_results[0]
+                
+                # Look for image-level AUROC
+                for key in result_dict.keys():
+                    key_lower = key.lower()
+                    if "image" in key_lower and "auroc" in key_lower:
+                        image_auroc = float(result_dict[key])
+                        print(f"✓ Found image-level AUROC in test results: {key} = {image_auroc:.4f}")
+                        break
+                
+                # Try to find test sample count
+                for key in result_dict.keys():
+                    key_lower = key.lower()
+                    if "test" in key_lower and any(x in key_lower for x in ["size", "count", "n", "samples"]):
+                        n_test = int(result_dict[key])
+                        break
+        except Exception as e:
+            print(f"Warning: Engine.test() failed: {e}")
+            test_results = None
+    else:
         test_results = None
     
-    # If AUROC not found, calculate manually using Trainer.predict()
+    # If AUROC not found, calculate manually
     if image_auroc is None:
         print("Calculating AUROC manually from predictions...")
-        try:
-            from pytorch_lightning import Trainer
-            import torch
-            
-            trainer = Trainer(
-                accelerator=accelerator_for_engine if accelerator_for_engine else None,
-                logger=False,
-                devices=1,
-            )
-            
-            # Get predictions
-            datamodule.setup("test")
-            predictions = trainer.predict(model, datamodule=datamodule)
-            
-            # Collect scores and labels
-            all_scores = []
-            all_labels = []
-            
-            datamodule.setup("test")
-            test_dataloader = datamodule.test_dataloader()
-            
-            model.eval()
-            with torch.no_grad():
-                for batch in test_dataloader:
-                    # Get prediction from model
-                    if isinstance(batch, dict):
-                        # Extract image and label
-                        images = batch.get("image", None)
-                        labels = batch.get("label", batch.get("mask", None))
-                    elif hasattr(batch, "image"):
-                        images = batch.image
-                        labels = getattr(batch, "label", None)
-                    else:
-                        continue
-                    
-                    if images is None:
-                        continue
-                    
-                    # Get model output
+        
+        from pytorch_lightning import Trainer
+        
+        # Setup datamodule
+        datamodule.setup("test")
+        test_dataloader = datamodule.test_dataloader()
+        
+        # Collect predictions and labels
+        all_scores = []
+        all_labels = []
+        
+        model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_dataloader):
+                # Extract labels from batch
+                if isinstance(batch, dict):
+                    labels = batch.get("label", None)
+                elif hasattr(batch, "label"):
+                    labels = batch.label
+                else:
+                    labels = None
+                
+                # Get predictions using model's test_step or predict_step
+                try:
+                    # Use test_step which is designed for evaluation
+                    output = model.test_step(batch, batch_idx)
+                except Exception:
                     try:
-                        output_dict = model.predict_step({"image": images}, batch_idx=0)
-                    except:
+                        # Fallback to predict_step
+                        output = model.predict_step(batch, batch_idx)
+                    except Exception:
                         try:
-                            output_dict = model.validation_step({"image": images}, batch_idx=0)
-                        except:
+                            # Fallback to validation_step
+                            output = model.validation_step(batch, batch_idx)
+                        except Exception as e:
+                            print(f"Warning: Could not get predictions for batch {batch_idx}: {e}")
                             continue
+                
+                # Extract anomaly scores
+                if isinstance(output, dict):
+                    # Try different keys for anomaly score
+                    score = None
+                    for key in ["pred_score", "anomaly_score", "score", "pred_scores", "image_pred_score"]:
+                        if key in output:
+                            score = output[key]
+                            break
                     
-                    # Extract score
-                    if isinstance(output_dict, dict):
-                        score_key = None
-                        for key in ["pred_score", "anomaly_score", "score", "pred_scores"]:
-                            if key in output_dict:
-                                score_key = key
+                    if score is None:
+                        # Take first tensor value
+                        for val in output.values():
+                            if torch.is_tensor(val):
+                                score = val
                                 break
-                        if score_key:
-                            scores = output_dict[score_key]
-                            if torch.is_tensor(scores):
-                                scores = scores.cpu().numpy()
-                            if scores.ndim > 1:
-                                scores = scores.reshape(scores.shape[0], -1).mean(axis=1)
-                            all_scores.extend(scores.flatten())
                     
-                    # Extract labels
-                    if labels is not None:
-                        if torch.is_tensor(labels):
-                            labels = labels.cpu().numpy()
-                        if labels.ndim > 1:
-                            labels = labels.reshape(labels.shape[0], -1).max(axis=1)
-                        all_labels.extend(labels.flatten())
+                    if score is not None:
+                        if torch.is_tensor(score):
+                            score = score.cpu().numpy()
+                        
+                        # Flatten to image-level (mean if multi-dimensional)
+                        if score.ndim > 1:
+                            score = score.reshape(score.shape[0], -1).mean(axis=1)
+                        
+                        all_scores.extend(score.flatten())
+                
+                # Extract labels if available
+                if labels is not None:
+                    if torch.is_tensor(labels):
+                        labels = labels.cpu().numpy()
+                    
+                    # Convert to binary: 0=normal, 1=anomaly
+                    if labels.ndim > 1:
+                        # For masks, check if any pixel is anomalous
+                        labels = labels.reshape(labels.shape[0], -1).max(axis=1)
+                    
+                    all_labels.extend(labels.flatten())
+        
+        # Calculate AUROC
+        if all_scores and all_labels and len(all_scores) == len(all_labels):
+            all_scores = np.array(all_scores)
+            all_labels = np.array(all_labels)
             
-            # Calculate AUROC
-            if all_scores and all_labels and len(all_scores) == len(all_labels):
-                all_scores = np.array(all_scores)
-                all_labels = np.array(all_labels)
+            try:
                 image_auroc = roc_auc_score(all_labels, all_scores)
                 n_test = len(all_scores)
-                print(f"Calculated image-level AUROC: {image_auroc:.4f}")
-            else:
-                print(f"Warning: Could not collect predictions. Scores: {len(all_scores) if all_scores else 0}, Labels: {len(all_labels) if all_labels else 0}")
-        except Exception as e:
-            print(f"Warning: Manual AUROC calculation failed: {e}")
+                print(f"✓ Calculated image-level AUROC: {image_auroc:.4f} (from {n_test} samples)")
+            except Exception as e:
+                print(f"Warning: Could not calculate AUROC: {e}")
+        else:
+            print(f"Warning: Could not collect predictions. Scores: {len(all_scores) if all_scores else 0}, Labels: {len(all_labels) if all_labels else 0}")
     
     # Prepare metrics
     metrics = {
