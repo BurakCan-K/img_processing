@@ -1,4 +1,7 @@
 anomalib
+# PyTorch with CUDA support (for RTX 3060)
+# Note: Install PyTorch with CUDA from https://pytorch.org/get-started/locally/
+# For CUDA 12.4/12.7, use: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch
 torchvision
 numpy
